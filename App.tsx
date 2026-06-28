@@ -1,6 +1,7 @@
 import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   Alert,
+  BackHandler,
   FlatList,
   NativeModules,
   PermissionsAndroid,
@@ -42,6 +43,16 @@ type PlayerState = {
   volume: number;
 };
 
+type PlaybackProgress = {
+  uri: string;
+  positionMs: number;
+  durationMs: number;
+  completed: boolean;
+  updatedAt: number;
+};
+
+type ProgressByUri = Record<string, PlaybackProgress>;
+
 type Screen =
   | {name: 'library'}
   | {name: 'folder'; folder: AudioFolder}
@@ -49,7 +60,7 @@ type Screen =
 
 type FolderSort = 'name' | 'date';
 
-const {AudioLibrary, AudioPlayer} = NativeModules as {
+const {AudioLibrary, AudioPlayer, PlaybackProgress} = NativeModules as {
   AudioLibrary?: {
     scanAudioFiles: () => Promise<AudioFile[]>;
   };
@@ -64,6 +75,15 @@ const {AudioLibrary, AudioPlayer} = NativeModules as {
     setVolume: (volume: number) => Promise<PlayerState>;
     getState: () => Promise<PlayerState>;
   };
+  PlaybackProgress?: {
+    getAllProgress: () => Promise<ProgressByUri>;
+    saveProgress: (
+      uri: string,
+      positionMs: number,
+      durationMs: number,
+      completed: boolean,
+    ) => Promise<PlaybackProgress>;
+  };
 };
 
 function App() {
@@ -71,6 +91,7 @@ function App() {
   const [files, setFiles] = useState<AudioFile[]>([]);
   const [folderSort, setFolderSort] = useState<FolderSort>('name');
   const [isScanning, setIsScanning] = useState(false);
+  const [progressByUri, setProgressByUri] = useState<ProgressByUri>({});
   const [playerState, setPlayerState] = useState<PlayerState>({
     index: -1,
     isPlaying: false,
@@ -78,11 +99,29 @@ function App() {
     positionMs: 0,
     volume: 1,
   });
+  const lastSavedProgressRef = useRef<{uri?: string; positionMs: number; savedAt: number}>({
+    positionMs: 0,
+    savedAt: 0,
+  });
 
   const folders = useMemo(
     () => buildFolders(files, folderSort),
     [files, folderSort],
   );
+  const currentPlayback = useMemo(() => {
+    if (!playerState.currentUri) {
+      return undefined;
+    }
+
+    for (const folder of folders) {
+      const index = folder.files.findIndex(file => file.uri === playerState.currentUri);
+      if (index >= 0) {
+        return {folder, file: folder.files[index], index};
+      }
+    }
+
+    return undefined;
+  }, [folders, playerState.currentUri]);
 
   const scanLibrary = useCallback(async () => {
     if (Platform.OS !== 'android') {
@@ -116,6 +155,52 @@ function App() {
     scanLibrary();
   }, [scanLibrary]);
 
+  const refreshProgress = useCallback(async () => {
+    if (!PlaybackProgress) {
+      return;
+    }
+
+    const result = await PlaybackProgress.getAllProgress();
+    setProgressByUri(result);
+  }, []);
+
+  useEffect(() => {
+    refreshProgress();
+  }, [refreshProgress]);
+
+  const savePlaybackProgress = useCallback(
+    async (state: PlayerState, force = false) => {
+      if (!PlaybackProgress || !state.currentUri || state.durationMs <= 0) {
+        return;
+      }
+
+      const now = Date.now();
+      const lastSaved = lastSavedProgressRef.current;
+      const sameFile = lastSaved.uri === state.currentUri;
+      const positionDelta = Math.abs(state.positionMs - lastSaved.positionMs);
+
+      if (!force && sameFile && positionDelta < 5000 && now - lastSaved.savedAt < 5000) {
+        return;
+      }
+
+      const completed = isCompleted(state.positionMs, state.durationMs);
+      const saved = await PlaybackProgress.saveProgress(
+        state.currentUri,
+        completed ? state.durationMs : state.positionMs,
+        state.durationMs,
+        completed,
+      );
+
+      lastSavedProgressRef.current = {
+        uri: state.currentUri,
+        positionMs: state.positionMs,
+        savedAt: now,
+      };
+      setProgressByUri(current => ({...current, [state.currentUri!]: saved}));
+    },
+    [],
+  );
+
   useEffect(() => {
     if (!AudioPlayer) {
       return;
@@ -125,13 +210,14 @@ function App() {
       try {
         const state = await AudioPlayer.getState();
         setPlayerState(state);
+        savePlaybackProgress(state);
       } catch {
         // Player can be empty before the first file is opened.
       }
     }, 700);
 
     return () => clearInterval(timer);
-  }, []);
+  }, [savePlaybackProgress]);
 
   const openPlayer = async (folder: AudioFolder, index: number) => {
     if (!AudioPlayer) {
@@ -143,9 +229,75 @@ function App() {
       folder.files.map(file => file.uri),
       index,
     );
-    setPlayerState(state);
+    const fileProgress = progressByUri[folder.files[index]?.uri];
+    const shouldResume =
+      fileProgress &&
+      !fileProgress.completed &&
+      fileProgress.positionMs > 3000 &&
+      fileProgress.positionMs < state.durationMs - 3000;
+    const nextState = shouldResume
+      ? await AudioPlayer.seekTo(fileProgress.positionMs)
+      : state;
+
+    setPlayerState(nextState);
     setScreen({name: 'player', folder, index});
   };
+
+  const navigateBack = useCallback(async () => {
+    if (screen.name === 'player') {
+      await savePlaybackProgress(playerState, true);
+      setScreen({name: 'folder', folder: screen.folder});
+      return true;
+    }
+
+    if (screen.name === 'folder') {
+      setScreen({name: 'library'});
+      return true;
+    }
+
+    return false;
+  }, [playerState, savePlaybackProgress, screen]);
+
+  useEffect(() => {
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      if (screen.name === 'library') {
+        return false;
+      }
+
+      navigateBack().catch(() => undefined);
+      return true;
+    });
+
+    return () => subscription.remove();
+  }, [navigateBack, screen.name]);
+
+  const openCurrentPlayer = useCallback(() => {
+    if (!currentPlayback) {
+      return;
+    }
+
+    setScreen({
+      name: 'player',
+      folder: currentPlayback.folder,
+      index: currentPlayback.index,
+    });
+  }, [currentPlayback]);
+
+  const toggleMiniPlayback = useCallback(async () => {
+    if (!AudioPlayer) {
+      return;
+    }
+
+    if (playerState.isPlaying) {
+      const state = await AudioPlayer.pause();
+      setPlayerState(state);
+      await savePlaybackProgress(state, true);
+      return;
+    }
+
+    const state = await AudioPlayer.resume();
+    setPlayerState(state);
+  }, [playerState.isPlaying, savePlaybackProgress]);
 
   return (
     <SafeAreaProvider>
@@ -165,7 +317,11 @@ function App() {
         {screen.name === 'folder' ? (
           <FolderScreen
             folder={screen.folder}
-            onBack={() => setScreen({name: 'library'})}
+            progressByUri={progressByUri}
+            currentUri={playerState.currentUri}
+            onBack={() => {
+              navigateBack().catch(() => undefined);
+            }}
             onPlay={index => openPlayer(screen.folder, index)}
           />
         ) : null}
@@ -174,13 +330,39 @@ function App() {
           <PlayerScreen
             folder={screen.folder}
             playerState={playerState}
-            onBack={() => setScreen({name: 'folder', folder: screen.folder})}
-            onPause={async () => setPlayerState(await AudioPlayer!.pause())}
+            progress={playerState.currentUri ? progressByUri[playerState.currentUri] : undefined}
+            onBack={() => {
+              navigateBack().catch(() => undefined);
+            }}
+            onPause={async () => {
+              const state = await AudioPlayer!.pause();
+              setPlayerState(state);
+              await savePlaybackProgress(state, true);
+            }}
             onResume={async () => setPlayerState(await AudioPlayer!.resume())}
-            onNext={async () => setPlayerState(await AudioPlayer!.next())}
-            onPrevious={async () => setPlayerState(await AudioPlayer!.previous())}
-            onSeek={async position => setPlayerState(await AudioPlayer!.seekTo(position))}
+            onNext={async () => {
+              await savePlaybackProgress(playerState, true);
+              setPlayerState(await AudioPlayer!.next());
+            }}
+            onPrevious={async () => {
+              await savePlaybackProgress(playerState, true);
+              setPlayerState(await AudioPlayer!.previous());
+            }}
+            onSeek={async position => {
+              const state = await AudioPlayer!.seekTo(position);
+              setPlayerState(state);
+              await savePlaybackProgress(state, true);
+            }}
             onVolume={async volume => setPlayerState(await AudioPlayer!.setVolume(volume))}
+          />
+        ) : null}
+
+        {screen.name !== 'player' && currentPlayback ? (
+          <MiniPlayer
+            file={currentPlayback.file}
+            playerState={playerState}
+            onOpen={openCurrentPlayer}
+            onToggle={toggleMiniPlayback}
           />
         ) : null}
       </SafeAreaView>
@@ -250,10 +432,14 @@ function LibraryScreen({
 
 function FolderScreen({
   folder,
+  progressByUri,
+  currentUri,
   onBack,
   onPlay,
 }: {
   folder: AudioFolder;
+  progressByUri: ProgressByUri;
+  currentUri?: string;
   onBack: () => void;
   onPlay: (index: number) => void;
 }) {
@@ -264,19 +450,50 @@ function FolderScreen({
         data={folder.files}
         keyExtractor={item => item.uri}
         contentContainerStyle={styles.listContent}
-        renderItem={({item, index}) => (
-          <Pressable style={styles.row} onPress={() => onPlay(index)}>
-            <View style={styles.playBadge}>
-              <Text style={styles.playBadgeText}>▶</Text>
-            </View>
-            <View style={styles.rowBody}>
-              <Text style={styles.rowTitle} numberOfLines={1}>
-                {item.fileName}
-              </Text>
-              <Text style={styles.rowMeta}>{formatDuration(item.durationMs)}</Text>
-            </View>
-          </Pressable>
-        )}
+        renderItem={({item, index}) => {
+          const progress = progressByUri[item.uri];
+          const completed = progress?.completed;
+          const hasProgress = progress && progress.positionMs > 3000 && !completed;
+          const isCurrent = item.uri === currentUri;
+
+          return (
+            <Pressable
+              style={[styles.row, isCurrent && styles.currentRow]}
+              onPress={() => onPlay(index)}>
+              <View
+                style={[
+                  styles.playBadge,
+                  completed && styles.completedBadge,
+                  isCurrent && styles.currentBadge,
+                ]}>
+                <Text style={styles.playBadgeText}>
+                  {isCurrent ? 'Ⅱ' : completed ? '✓' : '▶'}
+                </Text>
+              </View>
+              <View style={styles.rowBody}>
+                <Text
+                  style={[
+                    styles.rowTitle,
+                    completed && styles.completedTitle,
+                    isCurrent && styles.currentTitle,
+                  ]}
+                  numberOfLines={1}>
+                  {item.fileName}
+                </Text>
+                <Text style={styles.rowMeta}>
+                  {formatDuration(item.durationMs)}
+                  {isCurrent
+                    ? ' · сейчас играет'
+                    : hasProgress
+                    ? ` · ${formatDuration(progress.positionMs)}`
+                    : completed
+                      ? ' · прослушано'
+                      : ''}
+                </Text>
+              </View>
+            </Pressable>
+          );
+        }}
       />
     </View>
   );
@@ -285,6 +502,7 @@ function FolderScreen({
 function PlayerScreen({
   folder,
   playerState,
+  progress,
   onBack,
   onPause,
   onResume,
@@ -295,6 +513,7 @@ function PlayerScreen({
 }: {
   folder: AudioFolder;
   playerState: PlayerState;
+  progress?: PlaybackProgress;
   onBack: () => void;
   onPause: () => void;
   onResume: () => void;
@@ -355,6 +574,49 @@ function PlayerScreen({
         <Text style={styles.nextText} numberOfLines={1}>
           Следующий: {nextFile?.fileName ?? 'конец папки'}
         </Text>
+        {progress?.completed ? (
+          <Text style={styles.progressHint}>Прослушано</Text>
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
+function MiniPlayer({
+  file,
+  playerState,
+  onOpen,
+  onToggle,
+}: {
+  file: AudioFile;
+  playerState: PlayerState;
+  onOpen: () => void;
+  onToggle: () => void;
+}) {
+  const ratio =
+    playerState.durationMs > 0
+      ? Math.min(1, Math.max(0, playerState.positionMs / playerState.durationMs))
+      : 0;
+
+  return (
+    <View style={styles.miniPlayer}>
+      <View style={styles.miniProgressTrack}>
+        <View style={[styles.miniProgressFill, {width: `${ratio * 100}%`}]} />
+      </View>
+      <View style={styles.miniPlayerRow}>
+        <Pressable style={styles.miniPlayButton} onPress={onToggle}>
+          <Text style={styles.miniPlayButtonText}>
+            {playerState.isPlaying ? 'Ⅱ' : '▶'}
+          </Text>
+        </Pressable>
+        <Pressable style={styles.miniPlayerBody} onPress={onOpen}>
+          <Text style={styles.miniPlayerTitle} numberOfLines={1}>
+            {file.fileName}
+          </Text>
+          <Text style={styles.miniPlayerMeta}>
+            {formatDuration(playerState.positionMs)} / {formatDuration(playerState.durationMs)}
+          </Text>
+        </Pressable>
       </View>
     </View>
   );
@@ -521,6 +783,15 @@ function buildFolders(files: AudioFile[], sort: FolderSort) {
   );
 }
 
+function isCompleted(positionMs: number, durationMs: number) {
+  if (durationMs <= 0) {
+    return false;
+  }
+
+  const remainingMs = durationMs - positionMs;
+  return remainingMs <= 15000 || positionMs / durationMs >= 0.97;
+}
+
 function naturalCompare(a: string, b: string) {
   return a.localeCompare(b, undefined, {numeric: true, sensitivity: 'base'});
 }
@@ -647,6 +918,10 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderColor: '#dce4df',
   },
+  currentRow: {
+    backgroundColor: '#e8f2ee',
+    borderColor: '#0f6b5f',
+  },
   folderIcon: {
     width: 46,
     height: 46,
@@ -668,6 +943,12 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     backgroundColor: '#2e6f68',
   },
+  completedBadge: {
+    backgroundColor: '#7d8b84',
+  },
+  currentBadge: {
+    backgroundColor: '#0f6b5f',
+  },
   playBadgeText: {
     color: '#ffffff',
     fontSize: 15,
@@ -681,6 +962,12 @@ const styles = StyleSheet.create({
     color: '#111916',
     fontSize: 16,
     fontWeight: '700',
+  },
+  completedTitle: {
+    color: '#7a8580',
+  },
+  currentTitle: {
+    color: '#0f3f39',
   },
   rowMeta: {
     color: '#61706a',
@@ -845,6 +1132,61 @@ const styles = StyleSheet.create({
     color: '#61706a',
     fontSize: 14,
     textAlign: 'center',
+  },
+  progressHint: {
+    marginTop: 8,
+    color: '#0f6b5f',
+    fontSize: 13,
+    fontWeight: '800',
+    textAlign: 'center',
+  },
+  miniPlayer: {
+    borderTopWidth: 1,
+    borderTopColor: '#cfd9d4',
+    backgroundColor: '#ffffff',
+  },
+  miniProgressTrack: {
+    height: 3,
+    backgroundColor: '#d7dfda',
+  },
+  miniProgressFill: {
+    height: 3,
+    backgroundColor: '#0f6b5f',
+  },
+  miniPlayerRow: {
+    minHeight: 66,
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+  },
+  miniPlayButton: {
+    width: 44,
+    height: 44,
+    borderRadius: 22,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: '#0f6b5f',
+  },
+  miniPlayButtonText: {
+    color: '#ffffff',
+    fontSize: 19,
+    fontWeight: '900',
+  },
+  miniPlayerBody: {
+    flex: 1,
+    gap: 3,
+  },
+  miniPlayerTitle: {
+    color: '#111916',
+    fontSize: 15,
+    fontWeight: '800',
+  },
+  miniPlayerMeta: {
+    color: '#61706a',
+    fontSize: 12,
+    fontWeight: '700',
   },
 });
 

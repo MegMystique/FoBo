@@ -7,7 +7,10 @@ import com.facebook.react.uimanager.ViewManager
 
 class FoBoPackage : ReactPackage {
   override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> =
-      listOf(AudioLibraryModule(reactContext), AudioPlayerModule(reactContext))
+      listOf(
+          AudioLibraryModule(reactContext),
+          AudioPlayerModule(reactContext),
+          PlaybackProgressModule(reactContext))
 
   override fun createViewManagers(
       reactContext: ReactApplicationContext
