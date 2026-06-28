@@ -17,6 +17,7 @@ class AudioPlayerModule(private val reactContext: ReactApplicationContext) :
   private var currentIndex: Int = -1
   private var volume: Float = 1f
   private var prepared: Boolean = false
+  private var pauseAtEnd: Boolean = false
 
   override fun getName(): String = "AudioPlayer"
 
@@ -100,6 +101,12 @@ class AudioPlayerModule(private val reactContext: ReactApplicationContext) :
   }
 
   @ReactMethod
+  fun setPauseAtEnd(enabled: Boolean, promise: Promise) {
+    pauseAtEnd = enabled
+    promise.resolve(stateMap())
+  }
+
+  @ReactMethod
   fun getState(promise: Promise) {
     promise.resolve(stateMap())
   }
@@ -124,6 +131,11 @@ class AudioPlayerModule(private val reactContext: ReactApplicationContext) :
               promise.resolve(stateMap())
             }
             setOnCompletionListener {
+              if (pauseAtEnd) {
+                pauseAtEnd = false
+                return@setOnCompletionListener
+              }
+
               if (currentIndex < queue.lastIndex) {
                 playIndexSilently(currentIndex + 1)
               }
@@ -153,6 +165,11 @@ class AudioPlayerModule(private val reactContext: ReactApplicationContext) :
               it.start()
             }
             setOnCompletionListener {
+              if (pauseAtEnd) {
+                pauseAtEnd = false
+                return@setOnCompletionListener
+              }
+
               if (currentIndex < queue.lastIndex) {
                 playIndexSilently(currentIndex + 1)
               }

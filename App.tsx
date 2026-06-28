@@ -1,8 +1,9 @@
-import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
+﻿import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   Alert,
   BackHandler,
   FlatList,
+  Modal,
   NativeModules,
   PermissionsAndroid,
   Platform,
@@ -53,6 +54,12 @@ type PlaybackProgress = {
 
 type ProgressByUri = Record<string, PlaybackProgress>;
 
+type SleepTimer = {
+  deadlineAt: number;
+  finishChapter: boolean;
+  waitingForChapterEnd: boolean;
+};
+
 type Screen =
   | {name: 'library'}
   | {name: 'folder'; folder: AudioFolder}
@@ -73,6 +80,7 @@ const {AudioLibrary, AudioPlayer, PlaybackProgress} = NativeModules as {
     previous: () => Promise<PlayerState>;
     seekTo: (positionMs: number) => Promise<PlayerState>;
     setVolume: (volume: number) => Promise<PlayerState>;
+    setPauseAtEnd?: (enabled: boolean) => Promise<PlayerState>;
     getState: () => Promise<PlayerState>;
   };
   PlaybackProgress?: {
@@ -91,6 +99,8 @@ function App() {
   const [files, setFiles] = useState<AudioFile[]>([]);
   const [folderSort, setFolderSort] = useState<FolderSort>('name');
   const [isScanning, setIsScanning] = useState(false);
+  const [isSleepTimerOpen, setIsSleepTimerOpen] = useState(false);
+  const [sleepTimer, setSleepTimer] = useState<SleepTimer | undefined>();
   const [progressByUri, setProgressByUri] = useState<ProgressByUri>({});
   const [playerState, setPlayerState] = useState<PlayerState>({
     index: -1,
@@ -201,6 +211,56 @@ function App() {
     [],
   );
 
+  const setNativePauseAtEnd = useCallback(async (enabled: boolean) => {
+    if (!AudioPlayer?.setPauseAtEnd) {
+      return;
+    }
+
+    await AudioPlayer.setPauseAtEnd(enabled);
+  }, []);
+
+  const pauseForSleepTimer = useCallback(
+    async (state: PlayerState) => {
+      if (!AudioPlayer) {
+        return;
+      }
+
+      const pausedState = await AudioPlayer.pause();
+      setPlayerState(pausedState);
+      await savePlaybackProgress({...state, ...pausedState}, true);
+      setSleepTimer(undefined);
+    },
+    [savePlaybackProgress],
+  );
+
+  useEffect(() => {
+    if (!sleepTimer || !AudioPlayer) {
+      return;
+    }
+
+    const timer = setInterval(async () => {
+      const now = Date.now();
+
+      if (now < sleepTimer.deadlineAt) {
+        return;
+      }
+
+      if (!sleepTimer.finishChapter) {
+        await pauseForSleepTimer(playerState);
+        return;
+      }
+
+      if (!sleepTimer.waitingForChapterEnd) {
+        await setNativePauseAtEnd(true);
+        setSleepTimer(current =>
+          current ? {...current, waitingForChapterEnd: true} : current,
+        );
+      }
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [pauseForSleepTimer, playerState, setNativePauseAtEnd, sleepTimer]);
+
   useEffect(() => {
     if (!AudioPlayer) {
       return;
@@ -211,13 +271,40 @@ function App() {
         const state = await AudioPlayer.getState();
         setPlayerState(state);
         savePlaybackProgress(state);
+
+        if (
+          sleepTimer?.waitingForChapterEnd &&
+          !state.isPlaying &&
+          isAtTrackEnd(state.positionMs, state.durationMs)
+        ) {
+          await savePlaybackProgress(state, true);
+          setSleepTimer(undefined);
+        }
       } catch {
         // Player can be empty before the first file is opened.
       }
     }, 700);
 
     return () => clearInterval(timer);
-  }, [savePlaybackProgress]);
+  }, [savePlaybackProgress, sleepTimer?.waitingForChapterEnd]);
+
+  const startSleepTimer = useCallback(async (minutes: number, finishChapter: boolean) => {
+    await setNativePauseAtEnd(false);
+
+    setSleepTimer({
+      deadlineAt: Date.now() + minutes * 60 * 1000,
+      finishChapter,
+      waitingForChapterEnd: false,
+    });
+    setIsSleepTimerOpen(false);
+  }, [setNativePauseAtEnd]);
+
+  const cancelSleepTimer = useCallback(async () => {
+    await setNativePauseAtEnd(false);
+
+    setSleepTimer(undefined);
+    setIsSleepTimerOpen(false);
+  }, [setNativePauseAtEnd]);
 
   const openPlayer = async (folder: AudioFolder, index: number) => {
     if (!AudioPlayer) {
@@ -302,7 +389,7 @@ function App() {
   return (
     <SafeAreaProvider>
       <SafeAreaView style={styles.app}>
-        <StatusBar barStyle="dark-content" backgroundColor="#f5f7f4" />
+        <StatusBar barStyle="dark-content" backgroundColor="#fff8ec" />
         {screen.name === 'library' ? (
           <LibraryScreen
             folders={folders}
@@ -331,6 +418,7 @@ function App() {
             folder={screen.folder}
             playerState={playerState}
             progress={playerState.currentUri ? progressByUri[playerState.currentUri] : undefined}
+            sleepTimer={sleepTimer}
             onBack={() => {
               navigateBack().catch(() => undefined);
             }}
@@ -354,6 +442,8 @@ function App() {
               await savePlaybackProgress(state, true);
             }}
             onVolume={async volume => setPlayerState(await AudioPlayer!.setVolume(volume))}
+            onOpenSleepTimer={() => setIsSleepTimerOpen(true)}
+            onCancelSleepTimer={cancelSleepTimer}
           />
         ) : null}
 
@@ -365,6 +455,12 @@ function App() {
             onToggle={toggleMiniPlayback}
           />
         ) : null}
+
+        <SleepTimerModal
+          visible={isSleepTimerOpen}
+          onClose={() => setIsSleepTimerOpen(false)}
+          onStart={startSleepTimer}
+        />
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -503,6 +599,7 @@ function PlayerScreen({
   folder,
   playerState,
   progress,
+  sleepTimer,
   onBack,
   onPause,
   onResume,
@@ -510,10 +607,13 @@ function PlayerScreen({
   onPrevious,
   onSeek,
   onVolume,
+  onOpenSleepTimer,
+  onCancelSleepTimer,
 }: {
   folder: AudioFolder;
   playerState: PlayerState;
   progress?: PlaybackProgress;
+  sleepTimer?: SleepTimer;
   onBack: () => void;
   onPause: () => void;
   onResume: () => void;
@@ -521,9 +621,16 @@ function PlayerScreen({
   onPrevious: () => void;
   onSeek: (positionMs: number) => void;
   onVolume: (volume: number) => void;
+  onOpenSleepTimer: () => void;
+  onCancelSleepTimer: () => void;
 }) {
   const currentFile = folder.files[playerState.index] ?? folder.files[0];
   const nextFile = folder.files[playerState.index + 1];
+  const sleepTimerLabel = sleepTimer
+    ? sleepTimer.waitingForChapterEnd
+      ? 'Доигрывает главу'
+      : `Осталось ${formatCountdown(sleepTimer.deadlineAt - Date.now())}`
+    : 'Не установлен';
 
   return (
     <View style={styles.screen}>
@@ -566,10 +673,15 @@ function PlayerScreen({
           <Text style={styles.volumeIcon}>+</Text>
         </View>
 
-        <Pressable disabled style={styles.sleepTimer}>
+        <Pressable style={styles.sleepTimer} onPress={onOpenSleepTimer}>
           <Text style={styles.sleepTimerTitle}>⏱ Таймер сна</Text>
-          <Text style={styles.sleepTimerMeta}>Скоро</Text>
+          <Text style={styles.sleepTimerMeta}>{sleepTimerLabel}</Text>
         </Pressable>
+        {sleepTimer ? (
+          <Pressable style={styles.cancelSleepTimer} onPress={onCancelSleepTimer}>
+            <Text style={styles.cancelSleepTimerText}>Отменить таймер</Text>
+          </Pressable>
+        ) : null}
 
         <Text style={styles.nextText} numberOfLines={1}>
           Следующий: {nextFile?.fileName ?? 'конец папки'}
@@ -619,6 +731,64 @@ function MiniPlayer({
         </Pressable>
       </View>
     </View>
+  );
+}
+
+function SleepTimerModal({
+  visible,
+  onClose,
+  onStart,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  onStart: (minutes: number, finishChapter: boolean) => Promise<void>;
+}) {
+  const [finishChapter, setFinishChapter] = useState(false);
+  const options = [15, 30, 45, 60];
+
+  return (
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
+      <View style={styles.modalBackdrop}>
+        <Pressable style={styles.modalScrim} onPress={onClose} />
+        <View style={styles.sleepModal}>
+          <View style={styles.sleepModalHeader}>
+            <Text style={styles.sleepModalTitle}>Таймер сна</Text>
+            <Pressable style={styles.modalCloseButton} onPress={onClose}>
+              <Text style={styles.modalCloseText}>×</Text>
+            </Pressable>
+          </View>
+
+          <View style={styles.timerOptions}>
+            {options.map(minutes => (
+              <Pressable
+                key={minutes}
+                style={styles.timerOption}
+                onPress={() => {
+                  onStart(minutes, finishChapter).catch(error => {
+                    Alert.alert('Ошибка таймера', String(error));
+                  });
+                }}>
+                <Text style={styles.timerOptionText}>{minutes} мин</Text>
+              </Pressable>
+            ))}
+          </View>
+
+          <Pressable
+            style={styles.checkboxRow}
+            onPress={() => setFinishChapter(value => !value)}>
+            <View style={[styles.checkbox, finishChapter && styles.checkboxChecked]}>
+              {finishChapter ? <Text style={styles.checkboxMark}>✓</Text> : null}
+            </View>
+            <View style={styles.checkboxTextWrap}>
+              <Text style={styles.checkboxTitle}>Завершить главу</Text>
+              <Text style={styles.checkboxMeta}>
+                После выбранного времени доиграть текущую часть и остановиться.
+              </Text>
+            </View>
+          </Pressable>
+        </View>
+      </View>
+    </Modal>
   );
 }
 
@@ -792,8 +962,24 @@ function isCompleted(positionMs: number, durationMs: number) {
   return remainingMs <= 15000 || positionMs / durationMs >= 0.97;
 }
 
+function isAtTrackEnd(positionMs: number, durationMs: number) {
+  if (durationMs <= 0) {
+    return false;
+  }
+
+  return durationMs - positionMs <= 1500 || positionMs / durationMs >= 0.995;
+}
+
 function naturalCompare(a: string, b: string) {
   return a.localeCompare(b, undefined, {numeric: true, sensitivity: 'base'});
+}
+
+function formatCountdown(ms: number) {
+  const totalSeconds = Math.max(0, Math.ceil(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
 function formatDuration(ms: number) {
@@ -828,7 +1014,7 @@ function formatDate(value: number) {
 const styles = StyleSheet.create({
   app: {
     flex: 1,
-    backgroundColor: '#f5f7f4',
+    backgroundColor: '#fff8ec',
   },
   screen: {
     flex: 1,
@@ -839,7 +1025,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     paddingHorizontal: 16,
     borderBottomWidth: StyleSheet.hairlineWidth,
-    borderBottomColor: '#d7ddd5',
+    borderBottomColor: '#ead8c3',
   },
   headerButton: {
     width: 48,
@@ -847,13 +1033,13 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   headerButtonText: {
-    color: '#17211d',
+    color: '#151415',
     fontSize: 34,
     lineHeight: 36,
   },
   headerTitle: {
     flex: 1,
-    color: '#111916',
+    color: '#151415',
     fontSize: 24,
     fontWeight: '700',
   },
@@ -864,7 +1050,7 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   headerActionText: {
-    color: '#0f6b5f',
+    color: '#ea4f02',
     fontSize: 16,
     fontWeight: '700',
   },
@@ -874,7 +1060,7 @@ const styles = StyleSheet.create({
     paddingVertical: 14,
   },
   muted: {
-    color: '#61706a',
+    color: '#7a604f',
     fontSize: 13,
     fontWeight: '600',
   },
@@ -883,7 +1069,7 @@ const styles = StyleSheet.create({
     alignSelf: 'flex-start',
     padding: 3,
     borderRadius: 8,
-    backgroundColor: '#dde7e2',
+    backgroundColor: '#f6dfc6',
   },
   segment: {
     minWidth: 96,
@@ -893,14 +1079,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   segmentActive: {
-    backgroundColor: '#ffffff',
+    backgroundColor: '#fffaf3',
   },
   segmentText: {
-    color: '#61706a',
+    color: '#7a604f',
     fontWeight: '700',
   },
   segmentTextActive: {
-    color: '#121a17',
+    color: '#151415',
   },
   listContent: {
     padding: 16,
@@ -914,13 +1100,13 @@ const styles = StyleSheet.create({
     gap: 12,
     padding: 12,
     borderRadius: 8,
-    backgroundColor: '#ffffff',
+    backgroundColor: '#fffaf3',
     borderWidth: 1,
-    borderColor: '#dce4df',
+    borderColor: '#ead8c3',
   },
   currentRow: {
-    backgroundColor: '#e8f2ee',
-    borderColor: '#0f6b5f',
+    backgroundColor: '#fff0df',
+    borderColor: '#ea4f02',
   },
   folderIcon: {
     width: 46,
@@ -928,10 +1114,10 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#0f6b5f',
+    backgroundColor: '#ea4f02',
   },
   folderIconText: {
-    color: '#ffffff',
+    color: '#fffaf3',
     fontSize: 24,
     fontWeight: '800',
   },
@@ -941,16 +1127,16 @@ const styles = StyleSheet.create({
     borderRadius: 21,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#2e6f68',
+    backgroundColor: '#c13a02',
   },
   completedBadge: {
-    backgroundColor: '#7d8b84',
+    backgroundColor: '#9b7b66',
   },
   currentBadge: {
-    backgroundColor: '#0f6b5f',
+    backgroundColor: '#ea4f02',
   },
   playBadgeText: {
-    color: '#ffffff',
+    color: '#fffaf3',
     fontSize: 15,
     fontWeight: '800',
   },
@@ -959,28 +1145,28 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   rowTitle: {
-    color: '#111916',
+    color: '#151415',
     fontSize: 16,
     fontWeight: '700',
   },
   completedTitle: {
-    color: '#7a8580',
+    color: '#9b7b66',
   },
   currentTitle: {
-    color: '#0f3f39',
+    color: '#3c0f01',
   },
   rowMeta: {
-    color: '#61706a',
+    color: '#7a604f',
     fontSize: 13,
   },
   chevron: {
-    color: '#7f8b86',
+    color: '#b19079',
     fontSize: 32,
   },
   empty: {
     marginTop: 48,
     textAlign: 'center',
-    color: '#61706a',
+    color: '#7a604f',
     fontSize: 16,
   },
   playerPanel: {
@@ -989,7 +1175,7 @@ const styles = StyleSheet.create({
     paddingTop: 36,
   },
   bookTitle: {
-    color: '#111916',
+    color: '#151415',
     fontSize: 30,
     fontWeight: '800',
     textAlign: 'center',
@@ -997,7 +1183,7 @@ const styles = StyleSheet.create({
   trackTitle: {
     minHeight: 48,
     marginTop: 10,
-    color: '#61706a',
+    color: '#7a604f',
     fontSize: 18,
     lineHeight: 24,
     textAlign: 'center',
@@ -1008,7 +1194,7 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
   },
   time: {
-    color: '#61706a',
+    color: '#7a604f',
     fontWeight: '700',
   },
   scrubber: {
@@ -1025,7 +1211,7 @@ const styles = StyleSheet.create({
     right: 0,
     height: 6,
     borderRadius: 3,
-    backgroundColor: '#d7dfda',
+    backgroundColor: '#ead8c3',
   },
   scrubberTrackCompact: {
     height: 5,
@@ -1035,7 +1221,7 @@ const styles = StyleSheet.create({
     position: 'absolute',
     height: 6,
     borderRadius: 3,
-    backgroundColor: '#0f6b5f',
+    backgroundColor: '#ea4f02',
   },
   scrubberFillCompact: {
     height: 5,
@@ -1047,9 +1233,9 @@ const styles = StyleSheet.create({
     height: 20,
     marginLeft: -10,
     borderRadius: 10,
-    backgroundColor: '#ffffff',
+    backgroundColor: '#fffaf3',
     borderWidth: 3,
-    borderColor: '#0f6b5f',
+    borderColor: '#ea4f02',
   },
   scrubberThumbCompact: {
     width: 16,
@@ -1072,28 +1258,28 @@ const styles = StyleSheet.create({
     borderRadius: 29,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#ffffff',
+    backgroundColor: '#fffaf3',
     borderWidth: 1,
-    borderColor: '#dce4df',
+    borderColor: '#ead8c3',
   },
   roundButtonPrimary: {
     width: 74,
     height: 74,
     borderRadius: 37,
-    backgroundColor: '#0f6b5f',
-    borderColor: '#0f6b5f',
+    backgroundColor: '#ea4f02',
+    borderColor: '#ea4f02',
   },
   roundButtonText: {
-    color: '#111916',
+    color: '#151415',
     fontSize: 24,
     fontWeight: '800',
   },
   roundButtonTextPrimary: {
-    color: '#ffffff',
+    color: '#fffaf3',
     fontSize: 30,
   },
   sectionLabel: {
-    color: '#111916',
+    color: '#151415',
     fontSize: 16,
     fontWeight: '800',
   },
@@ -1105,7 +1291,7 @@ const styles = StyleSheet.create({
   },
   volumeIcon: {
     width: 20,
-    color: '#61706a',
+    color: '#7a604f',
     fontSize: 24,
     fontWeight: '900',
     textAlign: 'center',
@@ -1114,44 +1300,55 @@ const styles = StyleSheet.create({
     marginTop: 22,
     padding: 14,
     borderRadius: 8,
-    backgroundColor: '#e6ece8',
+    backgroundColor: '#fdebd7',
   },
   sleepTimerTitle: {
-    color: '#24322d',
+    color: '#3c0f01',
     fontSize: 16,
     fontWeight: '800',
   },
   sleepTimerMeta: {
     marginTop: 3,
-    color: '#61706a',
+    color: '#7a604f',
     fontSize: 13,
     fontWeight: '700',
   },
+  cancelSleepTimer: {
+    alignSelf: 'center',
+    marginTop: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  cancelSleepTimerText: {
+    color: '#ea4f02',
+    fontSize: 13,
+    fontWeight: '800',
+  },
   nextText: {
     marginTop: 24,
-    color: '#61706a',
+    color: '#7a604f',
     fontSize: 14,
     textAlign: 'center',
   },
   progressHint: {
     marginTop: 8,
-    color: '#0f6b5f',
+    color: '#ea4f02',
     fontSize: 13,
     fontWeight: '800',
     textAlign: 'center',
   },
   miniPlayer: {
     borderTopWidth: 1,
-    borderTopColor: '#cfd9d4',
-    backgroundColor: '#ffffff',
+    borderTopColor: '#ead8c3',
+    backgroundColor: '#fffaf3',
   },
   miniProgressTrack: {
     height: 3,
-    backgroundColor: '#d7dfda',
+    backgroundColor: '#ead8c3',
   },
   miniProgressFill: {
     height: 3,
-    backgroundColor: '#0f6b5f',
+    backgroundColor: '#ea4f02',
   },
   miniPlayerRow: {
     minHeight: 66,
@@ -1167,10 +1364,10 @@ const styles = StyleSheet.create({
     borderRadius: 22,
     alignItems: 'center',
     justifyContent: 'center',
-    backgroundColor: '#0f6b5f',
+    backgroundColor: '#ea4f02',
   },
   miniPlayButtonText: {
-    color: '#ffffff',
+    color: '#fffaf3',
     fontSize: 19,
     fontWeight: '900',
   },
@@ -1179,14 +1376,117 @@ const styles = StyleSheet.create({
     gap: 3,
   },
   miniPlayerTitle: {
-    color: '#111916',
+    color: '#151415',
     fontSize: 15,
     fontWeight: '800',
   },
   miniPlayerMeta: {
-    color: '#61706a',
+    color: '#7a604f',
     fontSize: 12,
     fontWeight: '700',
+  },
+  modalBackdrop: {
+    flex: 1,
+    justifyContent: 'flex-end',
+  },
+  modalScrim: {
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
+    backgroundColor: 'rgba(21, 20, 21, 0.38)',
+  },
+  sleepModal: {
+    paddingHorizontal: 18,
+    paddingTop: 16,
+    paddingBottom: 22,
+    borderTopLeftRadius: 8,
+    borderTopRightRadius: 8,
+    backgroundColor: '#fffaf3',
+  },
+  sleepModalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginBottom: 14,
+  },
+  sleepModalTitle: {
+    color: '#151415',
+    fontSize: 20,
+    fontWeight: '900',
+  },
+  modalCloseButton: {
+    width: 36,
+    height: 36,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalCloseText: {
+    color: '#7a604f',
+    fontSize: 30,
+    lineHeight: 32,
+  },
+  timerOptions: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  timerOption: {
+    minWidth: 96,
+    flexGrow: 1,
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 13,
+    borderRadius: 8,
+    backgroundColor: '#fff0df',
+    borderWidth: 1,
+    borderColor: '#e7c6a6',
+  },
+  timerOptionText: {
+    color: '#3c0f01',
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  checkboxRow: {
+    flexDirection: 'row',
+    gap: 12,
+    marginTop: 16,
+    padding: 12,
+    borderRadius: 8,
+    backgroundColor: '#fff8ec',
+  },
+  checkbox: {
+    width: 24,
+    height: 24,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: 6,
+    borderWidth: 2,
+    borderColor: '#ea4f02',
+    backgroundColor: '#fffaf3',
+  },
+  checkboxChecked: {
+    backgroundColor: '#ea4f02',
+  },
+  checkboxMark: {
+    color: '#fffaf3',
+    fontSize: 16,
+    fontWeight: '900',
+  },
+  checkboxTextWrap: {
+    flex: 1,
+    gap: 3,
+  },
+  checkboxTitle: {
+    color: '#151415',
+    fontSize: 15,
+    fontWeight: '900',
+  },
+  checkboxMeta: {
+    color: '#7a604f',
+    fontSize: 13,
+    lineHeight: 18,
   },
 });
 

@@ -2,5 +2,5 @@
 
 ## Iteration 2
 
-- Add a real sleep timer flow behind the disabled timer control.
+- Move the sleep timer into a foreground playback service when background playback is added.
 - Consider bookmarks after progress restore is stable.
