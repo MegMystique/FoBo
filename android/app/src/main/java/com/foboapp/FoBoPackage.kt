@@ -10,7 +10,8 @@ class FoBoPackage : ReactPackage {
       listOf(
           AudioLibraryModule(reactContext),
           AudioPlayerModule(reactContext),
-          PlaybackProgressModule(reactContext))
+          PlaybackProgressModule(reactContext),
+          FolderFavoritesModule(reactContext))
 
   override fun createViewManagers(
       reactContext: ReactApplicationContext

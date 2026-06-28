@@ -53,6 +53,7 @@ type PlaybackProgress = {
 };
 
 type ProgressByUri = Record<string, PlaybackProgress>;
+type FavoriteFolders = Record<string, boolean>;
 
 type SleepTimer = {
   deadlineAt: number;
@@ -67,7 +68,7 @@ type Screen =
 
 type FolderSort = 'name' | 'date';
 
-const {AudioLibrary, AudioPlayer, PlaybackProgress} = NativeModules as {
+const {AudioLibrary, AudioPlayer, PlaybackProgress, FolderFavorites} = NativeModules as {
   AudioLibrary?: {
     scanAudioFiles: () => Promise<AudioFile[]>;
   };
@@ -92,6 +93,10 @@ const {AudioLibrary, AudioPlayer, PlaybackProgress} = NativeModules as {
       completed: boolean,
     ) => Promise<PlaybackProgress>;
   };
+  FolderFavorites?: {
+    getFavoritePaths: () => Promise<string[]>;
+    setFavorite: (path: string, favorite: boolean) => Promise<boolean>;
+  };
 };
 
 function App() {
@@ -102,6 +107,7 @@ function App() {
   const [isSleepTimerOpen, setIsSleepTimerOpen] = useState(false);
   const [sleepTimer, setSleepTimer] = useState<SleepTimer | undefined>();
   const [progressByUri, setProgressByUri] = useState<ProgressByUri>({});
+  const [favoriteFolders, setFavoriteFolders] = useState<FavoriteFolders>({});
   const [playerState, setPlayerState] = useState<PlayerState>({
     index: -1,
     isPlaying: false,
@@ -115,8 +121,8 @@ function App() {
   });
 
   const folders = useMemo(
-    () => buildFolders(files, folderSort),
-    [files, folderSort],
+    () => buildFolders(files, folderSort, favoriteFolders),
+    [favoriteFolders, files, folderSort],
   );
   const currentPlayback = useMemo(() => {
     if (!playerState.currentUri) {
@@ -177,6 +183,43 @@ function App() {
   useEffect(() => {
     refreshProgress();
   }, [refreshProgress]);
+
+  const refreshFavoriteFolders = useCallback(async () => {
+    if (!FolderFavorites) {
+      return;
+    }
+
+    const paths = await FolderFavorites.getFavoritePaths();
+    setFavoriteFolders(
+      paths.reduce<FavoriteFolders>((acc, path) => {
+        acc[path] = true;
+        return acc;
+      }, {}),
+    );
+  }, []);
+
+  useEffect(() => {
+    refreshFavoriteFolders();
+  }, [refreshFavoriteFolders]);
+
+  const toggleFavoriteFolder = useCallback(async (folder: AudioFolder) => {
+    const nextFavorite = !favoriteFolders[folder.path];
+
+    setFavoriteFolders(current => ({
+      ...current,
+      [folder.path]: nextFavorite,
+    }));
+
+    try {
+      await FolderFavorites?.setFavorite(folder.path, nextFavorite);
+    } catch (error) {
+      setFavoriteFolders(current => ({
+        ...current,
+        [folder.path]: !nextFavorite,
+      }));
+      Alert.alert('Ошибка избранного', String(error));
+    }
+  }, [favoriteFolders]);
 
   const savePlaybackProgress = useCallback(
     async (state: PlayerState, force = false) => {
@@ -395,9 +438,11 @@ function App() {
             folders={folders}
             sort={folderSort}
             isScanning={isScanning}
+            favoriteFolders={favoriteFolders}
             onSortChange={setFolderSort}
             onScan={scanLibrary}
             onOpenFolder={folder => setScreen({name: 'folder', folder})}
+            onToggleFavorite={toggleFavoriteFolder}
           />
         ) : null}
 
@@ -470,16 +515,20 @@ function LibraryScreen({
   folders,
   sort,
   isScanning,
+  favoriteFolders,
   onSortChange,
   onScan,
   onOpenFolder,
+  onToggleFavorite,
 }: {
   folders: AudioFolder[];
   sort: FolderSort;
   isScanning: boolean;
+  favoriteFolders: FavoriteFolders;
   onSortChange: (sort: FolderSort) => void;
   onScan: () => void;
   onOpenFolder: (folder: AudioFolder) => void;
+  onToggleFavorite: (folder: AudioFolder) => void;
 }) {
   return (
     <View style={styles.screen}>
@@ -518,6 +567,17 @@ function LibraryScreen({
                 {item.files.length} файлов · изменено {formatDate(item.updatedAt)}
               </Text>
             </View>
+            <Pressable
+              style={styles.favoriteButton}
+              onPress={() => onToggleFavorite(item)}>
+              <Text
+                style={[
+                  styles.favoriteButtonText,
+                  favoriteFolders[item.path] && styles.favoriteButtonTextActive,
+                ]}>
+                {favoriteFolders[item.path] ? '★' : '☆'}
+              </Text>
+            </Pressable>
             <Text style={styles.chevron}>›</Text>
           </Pressable>
         )}
@@ -922,7 +982,11 @@ async function requestAudioPermission() {
   return result === PermissionsAndroid.RESULTS.GRANTED;
 }
 
-function buildFolders(files: AudioFile[], sort: FolderSort) {
+function buildFolders(
+  files: AudioFile[],
+  sort: FolderSort,
+  favoriteFolders: FavoriteFolders,
+) {
   const folders = new Map<string, AudioFolder>();
 
   files.forEach(file => {
@@ -948,9 +1012,18 @@ function buildFolders(files: AudioFile[], sort: FolderSort) {
     files: folder.files.sort((a, b) => naturalCompare(a.fileName, b.fileName)),
   }));
 
-  return result.sort((a, b) =>
-    sort === 'date' ? b.updatedAt - a.updatedAt : naturalCompare(a.name, b.name),
-  );
+  return result.sort((a, b) => {
+    const favoriteDelta = Number(Boolean(favoriteFolders[b.path])) -
+      Number(Boolean(favoriteFolders[a.path]));
+
+    if (favoriteDelta !== 0) {
+      return favoriteDelta;
+    }
+
+    return sort === 'date'
+      ? b.updatedAt - a.updatedAt
+      : naturalCompare(a.name, b.name);
+  });
 }
 
 function isCompleted(positionMs: number, durationMs: number) {
@@ -1158,6 +1231,20 @@ const styles = StyleSheet.create({
   rowMeta: {
     color: '#7a604f',
     fontSize: 13,
+  },
+  favoriteButton: {
+    width: 42,
+    height: 42,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  favoriteButtonText: {
+    color: '#b19079',
+    fontSize: 28,
+    lineHeight: 30,
+  },
+  favoriteButtonTextActive: {
+    color: '#ea4f02',
   },
   chevron: {
     color: '#b19079',
