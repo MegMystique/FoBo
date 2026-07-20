@@ -973,12 +973,14 @@ async function requestAudioPermission() {
     return false;
   }
 
-  const permission =
-    Platform.Version >= 33
-      ? PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO
-      : PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE;
+  const apiLevel = parseInt(Platform.Version.toString(), 10);
 
-  const result = await PermissionsAndroid.request(permission);
+  if (apiLevel >= 33) {
+    const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO);
+    return result === PermissionsAndroid.RESULTS.GRANTED;
+  }
+
+  const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE);
   return result === PermissionsAndroid.RESULTS.GRANTED;
 }
 

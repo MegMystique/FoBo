@@ -1,7 +1,16 @@
 package com.foboapp
 
+import android.content.Context
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.net.Uri
+import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.support.v4.media.session.MediaSessionCompat
+import android.support.v4.media.session.PlaybackStateCompat
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -18,8 +27,54 @@ class AudioPlayerModule(private val reactContext: ReactApplicationContext) :
   private var volume: Float = 1f
   private var prepared: Boolean = false
   private var pauseAtEnd: Boolean = false
+  // MediaPlayer callbacks can arrive after release().  This token makes sure an
+  // old chapter can never change the state of the chapter that replaced it.
+  private var playerGeneration: Long = 0
+
+  private val audioManager = reactContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+  private var focusRequest: AudioFocusRequest? = null
+  private var mediaSession: MediaSessionCompat? = null
+
+  private val afChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
+    when (focusChange) {
+      AudioManager.AUDIOFOCUS_LOSS -> {
+        pauseInternal()
+      }
+      AudioManager.AUDIOFOCUS_LOSS_TRANSIENT, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
+        pauseInternal()
+      }
+      AudioManager.AUDIOFOCUS_GAIN -> {
+        resumeInternal()
+      }
+    }
+  }
 
   override fun getName(): String = "AudioPlayer"
+
+  init {
+    val mainHandler = Handler(Looper.getMainLooper())
+    // Инициализируем MediaSession с использованием Handler главного потока
+    mediaSession = MediaSessionCompat(reactContext, "FoBoAudioPlayer").apply {
+      setCallback(object : MediaSessionCompat.Callback() {
+        override fun onPlay() {
+          mainHandler.post { resumeInternal() }
+        }
+
+        override fun onPause() {
+          mainHandler.post { pauseInternal() }
+        }
+
+        override fun onSkipToNext() {
+          mainHandler.post { nextInternal() }
+        }
+
+        override fun onSkipToPrevious() {
+          mainHandler.post { previousInternal() }
+        }
+      }, mainHandler)
+      isActive = true
+    }
+  }
 
   @ReactMethod
   fun loadQueue(uris: com.facebook.react.bridge.ReadableArray, index: Int, promise: Promise) {
@@ -40,41 +95,73 @@ class AudioPlayerModule(private val reactContext: ReactApplicationContext) :
 
   @ReactMethod
   fun pause(promise: Promise) {
+    pauseInternal()
+    promise.resolve(stateMap())
+  }
+
+  private fun pauseInternal() {
     try {
       if (prepared && player?.isPlaying == true) {
         player?.pause()
       }
-      promise.resolve(stateMap())
-    } catch (error: Exception) {
-      promise.reject("AUDIO_PAUSE_FAILED", error)
-    }
+      updatePlaybackState()
+      abandonAudioFocus()
+    } catch (_: Exception) {}
   }
 
   @ReactMethod
   fun resume(promise: Promise) {
-    try {
-      if (prepared) {
-        player?.start()
-      } else if (currentIndex in queue.indices) {
-        playIndexInternal(currentIndex, promise)
-        return
-      }
+    if (resumeInternal()) {
       promise.resolve(stateMap())
+    } else if (currentIndex in queue.indices) {
+      playIndexInternal(currentIndex, promise)
+    } else {
+      promise.resolve(stateMap())
+    }
+  }
+
+  private fun resumeInternal(): Boolean {
+    return try {
+      if (prepared) {
+        if (requestAudioFocus()) {
+          player?.start()
+          updatePlaybackState()
+          true
+        } else {
+          false
+        }
+      } else {
+        false
+      }
     } catch (error: Exception) {
-      promise.reject("AUDIO_RESUME_FAILED", error)
+      false
     }
   }
 
   @ReactMethod
   fun next(promise: Promise) {
+    nextInternal()
+    promise.resolve(stateMap())
+  }
+
+  private fun nextInternal() {
     val nextIndex = (currentIndex + 1).coerceAtMost(queue.lastIndex)
-    playIndexInternal(nextIndex, promise)
+    if (nextIndex != currentIndex) {
+      playIndexSilently(nextIndex)
+    }
   }
 
   @ReactMethod
   fun previous(promise: Promise) {
+    previousInternal()
+    promise.resolve(stateMap())
+  }
+
+  private fun previousInternal() {
     val previousIndex = (currentIndex - 1).coerceAtLeast(0)
-    playIndexInternal(previousIndex, promise)
+    if (previousIndex != currentIndex) {
+      playIndexSilently(previousIndex)
+    }
   }
 
   @ReactMethod
@@ -82,6 +169,7 @@ class AudioPlayerModule(private val reactContext: ReactApplicationContext) :
     try {
       if (prepared) {
         player?.seekTo(positionMs.toInt().coerceAtLeast(0))
+        updatePlaybackState()
       }
       promise.resolve(stateMap())
     } catch (error: Exception) {
@@ -118,27 +206,46 @@ class AudioPlayerModule(private val reactContext: ReactApplicationContext) :
         return
       }
 
+      if (!requestAudioFocus()) {
+        promise.reject("AUDIO_FOCUS_DENIED", "Could not acquire audio focus")
+        return
+      }
+
       prepared = false
       currentIndex = index
+      val generation = ++playerGeneration
       player?.release()
       player =
           MediaPlayer().apply {
             setDataSource(reactContext, Uri.parse(queue[index]))
             setVolume(volume, volume)
             setOnPreparedListener {
+              if (!isCurrentPlayer(it, generation)) return@setOnPreparedListener
               prepared = true
               it.start()
+              updatePlaybackState()
               promise.resolve(stateMap())
             }
             setOnCompletionListener {
+              if (!isCurrentPlayer(it, generation)) return@setOnCompletionListener
               if (pauseAtEnd) {
                 pauseAtEnd = false
+                updatePlaybackState()
                 return@setOnCompletionListener
               }
 
               if (currentIndex < queue.lastIndex) {
                 playIndexSilently(currentIndex + 1)
+              } else {
+                updatePlaybackState()
+                abandonAudioFocus()
               }
+            }
+            setOnErrorListener { mediaPlayer, _, _ ->
+              if (mediaPlayer != null && isCurrentPlayer(mediaPlayer, generation)) {
+                skipBrokenTrackOrStop()
+              }
+              true
             }
             prepareAsync()
           }
@@ -153,32 +260,111 @@ class AudioPlayerModule(private val reactContext: ReactApplicationContext) :
         return
       }
 
+      if (!requestAudioFocus()) {
+        return
+      }
+
       prepared = false
       currentIndex = index
+      val generation = ++playerGeneration
       player?.release()
       player =
           MediaPlayer().apply {
             setDataSource(reactContext, Uri.parse(queue[index]))
             setVolume(volume, volume)
             setOnPreparedListener {
+              if (!isCurrentPlayer(it, generation)) return@setOnPreparedListener
               prepared = true
               it.start()
+              updatePlaybackState()
             }
             setOnCompletionListener {
+              if (!isCurrentPlayer(it, generation)) return@setOnCompletionListener
               if (pauseAtEnd) {
                 pauseAtEnd = false
+                updatePlaybackState()
                 return@setOnCompletionListener
               }
 
               if (currentIndex < queue.lastIndex) {
                 playIndexSilently(currentIndex + 1)
+              } else {
+                updatePlaybackState()
+                abandonAudioFocus()
               }
+            }
+            setOnErrorListener { mediaPlayer, _, _ ->
+              if (mediaPlayer != null && isCurrentPlayer(mediaPlayer, generation)) {
+                skipBrokenTrackOrStop()
+              }
+              true
             }
             prepareAsync()
           }
     } catch (_: Exception) {
       prepared = false
+      updatePlaybackState()
     }
+  }
+
+  private fun isCurrentPlayer(candidate: MediaPlayer, generation: Long): Boolean =
+      player === candidate && playerGeneration == generation
+
+  private fun skipBrokenTrackOrStop() {
+    prepared = false
+    if (currentIndex < queue.lastIndex) {
+      playIndexSilently(currentIndex + 1)
+    } else {
+      updatePlaybackState()
+      abandonAudioFocus()
+    }
+  }
+
+  private fun requestAudioFocus(): Boolean {
+    return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      val playbackAttributes = AudioAttributes.Builder()
+          .setUsage(AudioAttributes.USAGE_MEDIA)
+          .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+          .build()
+      focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+          .setAudioAttributes(playbackAttributes)
+          .setAcceptsDelayedFocusGain(true)
+          .setOnAudioFocusChangeListener(afChangeListener)
+          .build()
+      audioManager.requestAudioFocus(focusRequest!!) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+    } else {
+      @Suppress("DEPRECATION")
+      audioManager.requestAudioFocus(afChangeListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+    }
+  }
+
+  private fun abandonAudioFocus() {
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+      focusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+    } else {
+      @Suppress("DEPRECATION")
+      audioManager.abandonAudioFocus(afChangeListener)
+    }
+  }
+
+  private fun updatePlaybackState() {
+    val stateBuilder = PlaybackStateCompat.Builder()
+        .setActions(
+            PlaybackStateCompat.ACTION_PLAY or
+            PlaybackStateCompat.ACTION_PAUSE or
+            PlaybackStateCompat.ACTION_SKIP_TO_NEXT or
+            PlaybackStateCompat.ACTION_SKIP_TO_PREVIOUS or
+            PlaybackStateCompat.ACTION_PLAY_PAUSE
+        )
+
+    val state = if (prepared && player?.isPlaying == true) {
+      PlaybackStateCompat.STATE_PLAYING
+    } else {
+      PlaybackStateCompat.STATE_PAUSED
+    }
+
+    stateBuilder.setState(state, player?.currentPosition?.toLong() ?: 0L, 1f)
+    mediaSession?.setPlaybackState(stateBuilder.build())
   }
 
   private fun stateMap(): WritableMap =
@@ -191,4 +377,10 @@ class AudioPlayerModule(private val reactContext: ReactApplicationContext) :
         putDouble("volume", volume.toDouble())
       }
 
+  override fun onCatalystInstanceDestroy() {
+    super.onCatalystInstanceDestroy()
+    mediaSession?.release()
+    player?.release()
+    abandonAudioFocus()
+  }
 }
