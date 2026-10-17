@@ -1,3 +1,44 @@
+# FoBo
+
+FoBo is an Android audiobook player for local files. It finds audio on the device, groups it by folder (one folder is one book) and plays the files in order, remembering where you stopped.
+
+## Features
+
+- **Library**: scans audio files on the device, groups them by folder, sorts by name or modification date; favorite folders are pinned to the top.
+- **Queue playback**: files in a folder play one after another in natural order (`2.mp3` comes before `10.mp3`); broken files are skipped.
+- **Progress**: the position is saved every few seconds, on pause and when switching files; finished files are marked with ✓, and reopening a file resumes where you left off.
+- **Background playback**: a foreground service with a notification and a wake lock keeps playback, auto-advance to the next file and progress saving working with the screen off.
+- **Sleep timer**: 15/30/45/60 minutes, with a "Finish chapter" option that plays the current file to the end and stops; pressing Play afterwards continues with the next chapter.
+- **Controls**: a mini player on the list screens, lock screen and headset buttons (MediaSession), pause during a phone call and automatic resume after it.
+
+## Project structure
+
+- `App.tsx`: the whole UI (library, folder, player, mini player, sleep timer).
+- `android/app/src/main/java/com/foboapp/`:
+  - `AudioLibraryModule.kt`: scans audio via MediaStore;
+  - `AudioPlayerModule.kt`: `MediaPlayer`-based player: queue, audio focus, MediaSession, sleep timer, progress saving;
+  - `PlaybackService.kt`: a foreground service that keeps the system from freezing the process during playback;
+  - `PlaybackProgressStore.kt` / `PlaybackProgressModule.kt`: progress storage in SharedPreferences;
+  - `FolderFavoritesModule.kt`: favorite folders.
+
+Playback, progress and sleep timer logic lives on the native side, because React Native JS timers stop when the app goes to the background.
+
+## Building the APK
+
+From the `android` folder, build the APK:
+
+```sh
+./gradlew assembleRelease   # on Windows: gradlew.bat assembleRelease
+```
+
+The output is `android/app/build/outputs/apk/release/app-release.apk`. The release build is signed with the debug key, so it installs over a debug build. Copy the file to the phone and install it, or install over USB:
+
+```sh
+adb install -r android/app/build/outputs/apk/release/app-release.apk
+```
+
+---
+
 This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
 
 # Getting Started

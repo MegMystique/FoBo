@@ -1,6 +1,7 @@
 ﻿import React, {useCallback, useEffect, useMemo, useRef, useState} from 'react';
 import {
   Alert,
+  AppState,
   BackHandler,
   FlatList,
   Modal,
@@ -42,6 +43,9 @@ type PlayerState = {
   durationMs: number;
   positionMs: number;
   volume: number;
+  sleepTimerDeadlineAt?: number;
+  sleepTimerFinishChapter?: boolean;
+  sleepTimerWaitingForChapterEnd?: boolean;
 };
 
 type PlaybackProgress = {
@@ -73,7 +77,7 @@ const {AudioLibrary, AudioPlayer, PlaybackProgress, FolderFavorites} = NativeMod
     scanAudioFiles: () => Promise<AudioFile[]>;
   };
   AudioPlayer?: {
-    loadQueue: (uris: string[], index: number) => Promise<PlayerState>;
+    loadQueue: (uris: string[], titles: string[], index: number) => Promise<PlayerState>;
     playIndex: (index: number) => Promise<PlayerState>;
     pause: () => Promise<PlayerState>;
     resume: () => Promise<PlayerState>;
@@ -81,7 +85,8 @@ const {AudioLibrary, AudioPlayer, PlaybackProgress, FolderFavorites} = NativeMod
     previous: () => Promise<PlayerState>;
     seekTo: (positionMs: number) => Promise<PlayerState>;
     setVolume: (volume: number) => Promise<PlayerState>;
-    setPauseAtEnd?: (enabled: boolean) => Promise<PlayerState>;
+    setSleepTimer: (durationMs: number, finishChapter: boolean) => Promise<PlayerState>;
+    cancelSleepTimer: () => Promise<PlayerState>;
     getState: () => Promise<PlayerState>;
   };
   PlaybackProgress?: {
@@ -105,7 +110,6 @@ function App() {
   const [folderSort, setFolderSort] = useState<FolderSort>('name');
   const [isScanning, setIsScanning] = useState(false);
   const [isSleepTimerOpen, setIsSleepTimerOpen] = useState(false);
-  const [sleepTimer, setSleepTimer] = useState<SleepTimer | undefined>();
   const [progressByUri, setProgressByUri] = useState<ProgressByUri>({});
   const [favoriteFolders, setFavoriteFolders] = useState<FavoriteFolders>({});
   const [playerState, setPlayerState] = useState<PlayerState>({
@@ -115,10 +119,21 @@ function App() {
     positionMs: 0,
     volume: 1,
   });
-  const lastSavedProgressRef = useRef<{uri?: string; positionMs: number; savedAt: number}>({
-    positionMs: 0,
-    savedAt: 0,
-  });
+  const sleepTimer = useMemo<SleepTimer | undefined>(
+    () =>
+      playerState.sleepTimerDeadlineAt
+        ? {
+            deadlineAt: playerState.sleepTimerDeadlineAt,
+            finishChapter: Boolean(playerState.sleepTimerFinishChapter),
+            waitingForChapterEnd: Boolean(playerState.sleepTimerWaitingForChapterEnd),
+          }
+        : undefined,
+    [
+      playerState.sleepTimerDeadlineAt,
+      playerState.sleepTimerFinishChapter,
+      playerState.sleepTimerWaitingForChapterEnd,
+    ],
+  );
 
   const folders = useMemo(
     () => buildFolders(files, folderSort, favoriteFolders),
@@ -221,88 +236,21 @@ function App() {
     }
   }, [favoriteFolders]);
 
-  const savePlaybackProgress = useCallback(
-    async (state: PlayerState, force = false) => {
-      if (!PlaybackProgress || !state.currentUri || state.durationMs <= 0) {
-        return;
-      }
-
-      const now = Date.now();
-      const lastSaved = lastSavedProgressRef.current;
-      const sameFile = lastSaved.uri === state.currentUri;
-      const positionDelta = Math.abs(state.positionMs - lastSaved.positionMs);
-
-      if (!force && sameFile && positionDelta < 5000 && now - lastSaved.savedAt < 5000) {
-        return;
-      }
-
-      const completed = isCompleted(state.positionMs, state.durationMs);
-      const saved = await PlaybackProgress.saveProgress(
-        state.currentUri,
-        completed ? state.durationMs : state.positionMs,
-        state.durationMs,
-        completed,
-      );
-
-      lastSavedProgressRef.current = {
-        uri: state.currentUri,
-        positionMs: state.positionMs,
-        savedAt: now,
-      };
-      setProgressByUri(current => ({...current, [state.currentUri!]: saved}));
-    },
-    [],
-  );
-
-  const setNativePauseAtEnd = useCallback(async (enabled: boolean) => {
-    if (!AudioPlayer?.setPauseAtEnd) {
-      return;
-    }
-
-    await AudioPlayer.setPauseAtEnd(enabled);
-  }, []);
-
-  const pauseForSleepTimer = useCallback(
-    async (state: PlayerState) => {
-      if (!AudioPlayer) {
-        return;
-      }
-
-      const pausedState = await AudioPlayer.pause();
-      setPlayerState(pausedState);
-      await savePlaybackProgress({...state, ...pausedState}, true);
-      setSleepTimer(undefined);
-    },
-    [savePlaybackProgress],
-  );
+  // Progress is written natively (it keeps working while JS is paused in the
+  // background), so JS only re-reads it when something may have changed.
+  useEffect(() => {
+    refreshProgress().catch(() => undefined);
+  }, [playerState.currentUri, playerState.isPlaying, refreshProgress]);
 
   useEffect(() => {
-    if (!sleepTimer || !AudioPlayer) {
-      return;
-    }
-
-    const timer = setInterval(async () => {
-      const now = Date.now();
-
-      if (now < sleepTimer.deadlineAt) {
-        return;
+    const subscription = AppState.addEventListener('change', nextState => {
+      if (nextState === 'active') {
+        refreshProgress().catch(() => undefined);
       }
+    });
 
-      if (!sleepTimer.finishChapter) {
-        await pauseForSleepTimer(playerState);
-        return;
-      }
-
-      if (!sleepTimer.waitingForChapterEnd) {
-        await setNativePauseAtEnd(true);
-        setSleepTimer(current =>
-          current ? {...current, waitingForChapterEnd: true} : current,
-        );
-      }
-    }, 1000);
-
-    return () => clearInterval(timer);
-  }, [pauseForSleepTimer, playerState, setNativePauseAtEnd, sleepTimer]);
+    return () => subscription.remove();
+  }, [refreshProgress]);
 
   useEffect(() => {
     if (!AudioPlayer) {
@@ -311,43 +259,31 @@ function App() {
 
     const timer = setInterval(async () => {
       try {
-        const state = await AudioPlayer.getState();
-        setPlayerState(state);
-        savePlaybackProgress(state);
-
-        if (
-          sleepTimer?.waitingForChapterEnd &&
-          !state.isPlaying &&
-          isAtTrackEnd(state.positionMs, state.durationMs)
-        ) {
-          await savePlaybackProgress(state, true);
-          setSleepTimer(undefined);
-        }
+        setPlayerState(await AudioPlayer.getState());
       } catch {
         // Player can be empty before the first file is opened.
       }
     }, 700);
 
     return () => clearInterval(timer);
-  }, [savePlaybackProgress, sleepTimer?.waitingForChapterEnd]);
+  }, []);
 
   const startSleepTimer = useCallback(async (minutes: number, finishChapter: boolean) => {
-    await setNativePauseAtEnd(false);
+    if (!AudioPlayer) {
+      return;
+    }
 
-    setSleepTimer({
-      deadlineAt: Date.now() + minutes * 60 * 1000,
-      finishChapter,
-      waitingForChapterEnd: false,
-    });
+    setPlayerState(await AudioPlayer.setSleepTimer(minutes * 60 * 1000, finishChapter));
     setIsSleepTimerOpen(false);
-  }, [setNativePauseAtEnd]);
+  }, []);
 
   const cancelSleepTimer = useCallback(async () => {
-    await setNativePauseAtEnd(false);
+    if (AudioPlayer) {
+      setPlayerState(await AudioPlayer.cancelSleepTimer());
+    }
 
-    setSleepTimer(undefined);
     setIsSleepTimerOpen(false);
-  }, [setNativePauseAtEnd]);
+  }, []);
 
   const openPlayer = async (folder: AudioFolder, index: number) => {
     if (!AudioPlayer) {
@@ -357,6 +293,7 @@ function App() {
 
     const state = await AudioPlayer.loadQueue(
       folder.files.map(file => file.uri),
+      folder.files.map(file => file.fileName),
       index,
     );
     const fileProgress = progressByUri[folder.files[index]?.uri];
@@ -375,7 +312,7 @@ function App() {
 
   const navigateBack = useCallback(async () => {
     if (screen.name === 'player') {
-      await savePlaybackProgress(playerState, true);
+      refreshProgress().catch(() => undefined);
       setScreen({name: 'folder', folder: screen.folder});
       return true;
     }
@@ -386,7 +323,7 @@ function App() {
     }
 
     return false;
-  }, [playerState, savePlaybackProgress, screen]);
+  }, [refreshProgress, screen]);
 
   useEffect(() => {
     const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
@@ -419,15 +356,13 @@ function App() {
     }
 
     if (playerState.isPlaying) {
-      const state = await AudioPlayer.pause();
-      setPlayerState(state);
-      await savePlaybackProgress(state, true);
+      setPlayerState(await AudioPlayer.pause());
       return;
     }
 
     const state = await AudioPlayer.resume();
     setPlayerState(state);
-  }, [playerState.isPlaying, savePlaybackProgress]);
+  }, [playerState.isPlaying]);
 
   return (
     <SafeAreaProvider>
@@ -467,25 +402,11 @@ function App() {
             onBack={() => {
               navigateBack().catch(() => undefined);
             }}
-            onPause={async () => {
-              const state = await AudioPlayer!.pause();
-              setPlayerState(state);
-              await savePlaybackProgress(state, true);
-            }}
+            onPause={async () => setPlayerState(await AudioPlayer!.pause())}
             onResume={async () => setPlayerState(await AudioPlayer!.resume())}
-            onNext={async () => {
-              await savePlaybackProgress(playerState, true);
-              setPlayerState(await AudioPlayer!.next());
-            }}
-            onPrevious={async () => {
-              await savePlaybackProgress(playerState, true);
-              setPlayerState(await AudioPlayer!.previous());
-            }}
-            onSeek={async position => {
-              const state = await AudioPlayer!.seekTo(position);
-              setPlayerState(state);
-              await savePlaybackProgress(state, true);
-            }}
+            onNext={async () => setPlayerState(await AudioPlayer!.next())}
+            onPrevious={async () => setPlayerState(await AudioPlayer!.previous())}
+            onSeek={async position => setPlayerState(await AudioPlayer!.seekTo(position))}
             onVolume={async volume => setPlayerState(await AudioPlayer!.setVolume(volume))}
             onOpenSleepTimer={() => setIsSleepTimerOpen(true)}
             onCancelSleepTimer={cancelSleepTimer}
@@ -976,8 +897,15 @@ async function requestAudioPermission() {
   const apiLevel = parseInt(Platform.Version.toString(), 10);
 
   if (apiLevel >= 33) {
-    const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO);
-    return result === PermissionsAndroid.RESULTS.GRANTED;
+    const result = await PermissionsAndroid.requestMultiple([
+      PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO,
+      // Lets the playback notification of the foreground service be shown.
+      PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS,
+    ]);
+    return (
+      result[PermissionsAndroid.PERMISSIONS.READ_MEDIA_AUDIO] ===
+      PermissionsAndroid.RESULTS.GRANTED
+    );
   }
 
   const result = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.READ_EXTERNAL_STORAGE);
@@ -1026,23 +954,6 @@ function buildFolders(
       ? b.updatedAt - a.updatedAt
       : naturalCompare(a.name, b.name);
   });
-}
-
-function isCompleted(positionMs: number, durationMs: number) {
-  if (durationMs <= 0) {
-    return false;
-  }
-
-  const remainingMs = durationMs - positionMs;
-  return remainingMs <= 15000 || positionMs / durationMs >= 0.97;
-}
-
-function isAtTrackEnd(positionMs: number, durationMs: number) {
-  if (durationMs <= 0) {
-    return false;
-  }
-
-  return durationMs - positionMs <= 1500 || positionMs / durationMs >= 0.995;
 }
 
 function naturalCompare(a: string, b: string) {

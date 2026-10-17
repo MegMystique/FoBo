@@ -1,6 +1,5 @@
 package com.foboapp
 
-import android.content.Context
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
@@ -12,8 +11,7 @@ import org.json.JSONObject
 class PlaybackProgressModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
-  private val preferences =
-      reactContext.getSharedPreferences("fobo_playback_progress", Context.MODE_PRIVATE)
+  private val preferences = PlaybackProgressStore.preferences(reactContext)
 
   override fun getName(): String = "PlaybackProgress"
 
@@ -40,15 +38,7 @@ class PlaybackProgressModule(private val reactContext: ReactApplicationContext) 
       promise: Promise
   ) {
     try {
-      val json =
-          JSONObject()
-              .put("uri", uri)
-              .put("positionMs", positionMs)
-              .put("durationMs", durationMs)
-              .put("completed", completed)
-              .put("updatedAt", System.currentTimeMillis().toDouble())
-
-      preferences.edit().putString(uri, json.toString()).apply()
+      val json = PlaybackProgressStore.save(reactContext, uri, positionMs, durationMs, completed)
       promise.resolve(jsonToMap(json))
     } catch (error: Exception) {
       promise.reject("PROGRESS_SAVE_FAILED", error)
